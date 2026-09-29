@@ -368,35 +368,33 @@ export class LanceMemoryStore implements MemoryStore {
 
   private async touchAccessed(ids: string[]): Promise<void> {
     if (!this.table || ids.length === 0) return;
-    const now = new Date().toISOString();
+    const now = new Date();
+    const hourAgo = new Date(now.getTime() - 3_600_000).toISOString();
+    const idList = ids.map(id => `'${sanitise(id)}'`).join(', ');
 
-    for (const id of ids) {
-      try {
-        const rows = await this.table.query()
-          .where(`id = '${sanitise(id)}'`)
-          .limit(1)
-          .toArray();
+    // Spacing effect: skip rows accessed within the last hour.
+    // Timestamps are toISOString() values, so they compare as text.
+    const where = `id IN (${idList}) AND COALESCE(last_accessed_at, updated_at) < '${hourAgo}'`;
 
-        if (rows.length === 0) continue;
-        const row = rows[0] as Record<string, unknown>;
-        const lastAccessed = (row.last_accessed_at as string) ?? (row.updated_at as string);
-        const hoursSince = (Date.now() - new Date(lastAccessed).getTime()) / 3_600_000;
+    try {
+      // An update commits a new table version even when it matches no rows,
+      // so check first rather than writing on every search
+      const due = await this.table.query().where(where).select(['id']).limit(ids.length).toArray();
+      if (due.length === 0) return;
 
-        // Spacing effect: skip increment if accessed within the last hour
-        if (hoursSince < 1) continue;
-
-        // Update in place: a failed delete-then-re-add would lose the memory
-        // (see update()), and this path swallows errors, so the loss was silent
-        await this.table.update({
-          where: `id = '${sanitise(id)}'`,
-          valuesSql: {
-            access_count: 'COALESCE(access_count, 0) + 1',
-            last_accessed_at: `'${now}'`,
-          },
-        });
-      } catch {
-        // Access tracking is best-effort — don't fail the search
-      }
+      // Update in place: a failed delete-then-re-add would lose the memory
+      // (see update()), and this path swallows errors, so the loss was silent.
+      // The condition stays in the update's WHERE clause, so concurrent searches
+      // that all passed the check above still count the access only once.
+      await this.table.update({
+        where,
+        valuesSql: {
+          access_count: 'COALESCE(access_count, 0) + 1',
+          last_accessed_at: `'${now.toISOString()}'`,
+        },
+      });
+    } catch {
+      // Access tracking is best-effort — don't fail the search
     }
   }
 

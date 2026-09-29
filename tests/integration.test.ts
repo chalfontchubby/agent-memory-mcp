@@ -549,6 +549,58 @@ describe('LanceMemoryStore integration', () => {
       expect(stats.neverAccessed).toBe(1);
     });
 
+    it('a search with nothing due for an access bump writes no table version', async () => {
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+      const table = (store as unknown as { table: { version(): Promise<number> } }).table;
+      const before = await table.version();
+
+      await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+      await accessBumpsSettled();
+
+      expect(await table.version()).toBe(before);
+    });
+
+    it('concurrent searches count one access, not one per search', async () => {
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 2 * 3_600_000);
+        await Promise.all(Array.from({ length: 5 }, () => store.search('hamiltonian cycles', 'semantic', { limit: 5 })));
+        await accessBumpsSettled();
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const stats = await store.stats();
+      expect(stats.totalMemories).toBe(1);
+      expect(stats.mostAccessed[0].count).toBe(1);
+    });
+
+    it('a second search within the hour of an access does not count again', async () => {
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 2 * 3_600_000);
+        await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        await accessBumpsSettled();
+        expect((await store.stats()).mostAccessed[0].count).toBe(1);
+
+        vi.setSystemTime(Date.now() + 30 * 60_000);
+        await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        await accessBumpsSettled();
+        expect((await store.stats()).mostAccessed[0].count).toBe(1);
+
+        vi.setSystemTime(Date.now() + 31 * 60_000);
+        await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        await accessBumpsSettled();
+        expect((await store.stats()).mostAccessed[0].count).toBe(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('stats mostAccessed has correct structure', async () => {
       await store.store({
         content: 'Popular memory about vector databases and similarity',
