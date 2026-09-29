@@ -5,6 +5,25 @@ import { tmpdir } from 'os';
 import { LanceMemoryStore } from '../src/memory-store.js';
 import { MockEmbedder } from './mocks.js';
 
+/**
+ * Record each access-tracking run a store starts. Search runs it fire-and-forget,
+ * so tests await the returned function to know it has finished, rather than
+ * sleeping and hoping.
+ */
+function trackAccessBumps(target: LanceMemoryStore): () => Promise<void> {
+  const internals = target as unknown as { touchAccessed(ids: string[]): Promise<void> };
+  const original = internals.touchAccessed.bind(target);
+  const pending: Promise<void>[] = [];
+  vi.spyOn(internals, 'touchAccessed').mockImplementation((ids: string[]) => {
+    const run = original(ids);
+    pending.push(run);
+    return run;
+  });
+  return async () => {
+    await Promise.all(pending);
+  };
+}
+
 // ── Integration tests against real LanceDB ────────────────────────
 //
 // These tests use the actual LanceMemoryStore with a real LanceDB
@@ -16,15 +35,20 @@ describe('LanceMemoryStore integration', () => {
   let store: LanceMemoryStore;
   let dbPath: string;
   let embedder: MockEmbedder;
+  let accessBumpsSettled: () => Promise<void>;
 
   beforeEach(async () => {
     dbPath = await mkdtemp(join(tmpdir(), 'agent-memory-test-'));
     embedder = new MockEmbedder();
     store = new LanceMemoryStore(dbPath, embedder);
     await store.initialize();
+    accessBumpsSettled = trackAccessBumps(store);
   });
 
   afterEach(async () => {
+    // A still-running access bump would write into the directory being removed
+    await accessBumpsSettled();
+    vi.restoreAllMocks();
     await rm(dbPath, { recursive: true, force: true });
   });
 
@@ -103,6 +127,90 @@ describe('LanceMemoryStore integration', () => {
 
       const stats = await store.stats();
       expect(stats.totalMemories).toBe(1);
+    });
+
+    it('keeps the row when only tags change', async () => {
+      const memory = await store.store({
+        content: 'Memory about vector databases',
+        category: 'learning',
+        tags: ['status:open'],
+      });
+
+      const updated = await store.update(memory.id, { tags: ['status:done'] });
+      expect(updated.tags).toEqual(['status:done']);
+      expect(updated.content).toBe('Memory about vector databases');
+
+      const stats = await store.stats();
+      expect(stats.totalMemories).toBe(1);
+      const results = await store.search('vector databases', 'semantic', { limit: 5 });
+      expect(results).toHaveLength(1);
+      expect(results[0].memory.tags).toEqual(['status:done']);
+    });
+
+    it('keeps the row when only the category changes', async () => {
+      const memory = await store.store({
+        content: 'Memory about vector databases',
+        category: 'learning',
+        tags: [],
+      });
+
+      const updated = await store.update(memory.id, { category: 'architecture' });
+      expect(updated.category).toBe('architecture');
+
+      const stats = await store.stats();
+      expect(stats.totalMemories).toBe(1);
+      expect(stats.byCategory).toEqual({ architecture: 1 });
+    });
+
+    it('re-embeds when content changes', async () => {
+      const memory = await store.store({
+        content: 'Memory about medieval typography',
+        category: 'learning',
+        tags: [],
+      });
+
+      await store.update(memory.id, { content: 'Memory about vector databases' });
+
+      // MockEmbedder is deterministic, so the new content's own text is an exact vector match
+      const results = await store.search('Memory about vector databases', 'semantic', { limit: 1 });
+      expect(results[0].memory.content).toBe('Memory about vector databases');
+      expect(results[0].score).toBeGreaterThan(0.99);
+    });
+
+    it('throws when the memory is deleted between the read and the write', async () => {
+      const memory = await store.store({ content: 'Short-lived memory', category: 'learning', tags: [] });
+      const internals = store as unknown as { fetchById(id: string): Promise<unknown> };
+      const row = await internals.fetchById(memory.id);
+
+      // Another process deletes it after update() has read the row
+      await store.delete(memory.id);
+      vi.spyOn(internals, 'fetchById').mockResolvedValueOnce(row);
+
+      await expect(store.update(memory.id, { tags: ['late'] })).rejects.toThrow('not found');
+      expect((await store.stats()).totalMemories).toBe(0);
+    });
+
+    it('a tags-only update after an access keeps the row and its access count', async () => {
+      const memory = await store.store({
+        content: 'Memory about unique hamiltonian cycles',
+        category: 'learning',
+        tags: [],
+      });
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 2 * 3_600_000);
+        await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        await accessBumpsSettled();
+      } finally {
+        vi.useRealTimers();
+      }
+      expect((await store.stats()).mostAccessed[0].count).toBe(1);
+
+      await store.update(memory.id, { tags: ['math'] });
+
+      const stats = await store.stats();
+      expect(stats.mostAccessed[0].count).toBe(1);
     });
   });
 
@@ -388,12 +496,109 @@ describe('LanceMemoryStore integration', () => {
       // Search immediately after creation — spacing effect should prevent
       // increment because last_accessed_at = creation time = just now (< 1 hour)
       await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
-      await new Promise(r => setTimeout(r, 300));
+      await accessBumpsSettled();
 
       // Memory should still be "never accessed" due to spacing effect
       const stats = await store.stats();
       expect(stats.neverAccessed).toBe(1);
       expect(stats.avgAccessCount).toBe(0);
+    });
+
+    it('search more than an hour after creation increments the count and keeps the row', async () => {
+      await store.store({
+        content: 'Memory about unique hamiltonian cycles in graph theory',
+        category: 'learning',
+        tags: ['math'],
+      });
+
+      // Only Date is faked, so LanceDB's own timers and I/O are unaffected
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 2 * 3_600_000);
+        const results = await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        expect(results).toHaveLength(1);
+        await accessBumpsSettled();
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const stats = await store.stats();
+      expect(stats.totalMemories).toBe(1);
+      expect(stats.neverAccessed).toBe(0);
+      expect(stats.mostAccessed[0].count).toBe(1);
+    });
+
+    it('findRelated more than an hour after creation keeps the related rows', async () => {
+      const source = await store.store({ content: 'Rust borrow checker lifetimes', category: 'learning', tags: [] });
+      await store.store({ content: 'Rust ownership and borrowing rules', category: 'learning', tags: [] });
+      await store.store({ content: 'Rust lifetime elision in functions', category: 'learning', tags: [] });
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 2 * 3_600_000);
+        const related = await store.findRelated(source.id, 5);
+        expect(related).toHaveLength(2);
+        await accessBumpsSettled();
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const stats = await store.stats();
+      expect(stats.totalMemories).toBe(3);
+      // The two related memories are bumped; the source memory is not
+      expect(stats.neverAccessed).toBe(1);
+    });
+
+    it('a search with nothing due for an access bump writes no table version', async () => {
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+      const table = (store as unknown as { table: { version(): Promise<number> } }).table;
+      const before = await table.version();
+
+      await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+      await accessBumpsSettled();
+
+      expect(await table.version()).toBe(before);
+    });
+
+    it('concurrent searches count one access, not one per search', async () => {
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 2 * 3_600_000);
+        await Promise.all(Array.from({ length: 5 }, () => store.search('hamiltonian cycles', 'semantic', { limit: 5 })));
+        await accessBumpsSettled();
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const stats = await store.stats();
+      expect(stats.totalMemories).toBe(1);
+      expect(stats.mostAccessed[0].count).toBe(1);
+    });
+
+    it('a second search within the hour of an access does not count again', async () => {
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 2 * 3_600_000);
+        await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        await accessBumpsSettled();
+        expect((await store.stats()).mostAccessed[0].count).toBe(1);
+
+        vi.setSystemTime(Date.now() + 30 * 60_000);
+        await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        await accessBumpsSettled();
+        expect((await store.stats()).mostAccessed[0].count).toBe(1);
+
+        vi.setSystemTime(Date.now() + 31 * 60_000);
+        await store.search('hamiltonian cycles', 'semantic', { limit: 5 });
+        await accessBumpsSettled();
+        expect((await store.stats()).mostAccessed[0].count).toBe(2);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('stats mostAccessed has correct structure', async () => {
