@@ -214,6 +214,23 @@ describe('LanceMemoryStore integration', () => {
     });
   });
 
+  // ── Multiple processes on one database ──────────────────────
+
+  describe('a second store on the same database', () => {
+    it('sees memories written by the first after it opened the table', async () => {
+      await store.store({ content: 'First memory', category: 'learning', tags: [] });
+
+      // Stands in for a second MCP server process, e.g. another editor window
+      const other = new LanceMemoryStore(dbPath, embedder);
+      await other.initialize();
+      expect((await other.stats()).totalMemories).toBe(1);
+
+      await store.store({ content: 'Second memory', category: 'learning', tags: [] });
+
+      expect((await other.stats()).totalMemories).toBe(2);
+    });
+  });
+
   describe('delete removes exactly one row', () => {
     it('reduces count by one', async () => {
       const a = await store.store({ content: 'Keep', category: 'learning', tags: [] });

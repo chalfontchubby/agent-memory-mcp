@@ -57,7 +57,9 @@ export class LanceMemoryStore implements MemoryStore {
   ) {}
 
   async initialize(): Promise<void> {
-    this.db = await lancedb.connect(this.dbPath);
+    // readConsistencyInterval 0: check for newer versions on every read, so writes by
+    // another process on the same database (another editor window's server) are seen
+    this.db = await lancedb.connect(this.dbPath, { readConsistencyInterval: 0 });
     this.reranker = await lancedb.rerankers.RRFReranker.create(60);
     const names = await this.db.tableNames();
     if (names.includes('memories')) {
