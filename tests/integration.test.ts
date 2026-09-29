@@ -229,6 +229,35 @@ describe('LanceMemoryStore integration', () => {
 
       expect((await other.stats()).totalMemories).toBe(2);
     });
+
+    it('picks up the table when another store creates it after this one started', async () => {
+      // Both start on an empty database, before the memories table exists
+      const other = new LanceMemoryStore(dbPath, embedder);
+      await other.initialize();
+
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+
+      expect((await other.stats()).totalMemories).toBe(1);
+      const otherBumpsSettled = trackAccessBumps(other);
+      const results = await other.search('hamiltonian', 'keyword', { limit: 5 });
+      expect(results).toHaveLength(1);
+      await otherBumpsSettled();
+
+      await other.store({ content: 'Second memory', category: 'learning', tags: [] });
+      expect((await store.stats()).totalMemories).toBe(2);
+    });
+
+    it('two stores storing their first memories at once both succeed', async () => {
+      const other = new LanceMemoryStore(dbPath, embedder);
+      await other.initialize();
+
+      await Promise.all([
+        store.store({ content: 'From the first store', category: 'learning', tags: [] }),
+        other.store({ content: 'From the second store', category: 'learning', tags: [] }),
+      ]);
+
+      expect((await store.stats()).totalMemories).toBe(2);
+    });
   });
 
   describe('delete removes exactly one row', () => {
