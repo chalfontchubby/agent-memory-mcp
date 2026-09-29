@@ -221,7 +221,9 @@ export class LanceMemoryStore implements MemoryStore {
     if (updates.content) {
       values.vector = await this.embedder.embed(content);
     }
-    await this.table.update({ where: `id = '${sanitise(id)}'`, values });
+    const result = await this.table.update({ where: `id = '${sanitise(id)}'`, values });
+    // Deleted since fetchById (prune, or another process)
+    if (result.rowsUpdated === 0) throw new Error(`Memory ${id} not found`);
 
     return {
       id,

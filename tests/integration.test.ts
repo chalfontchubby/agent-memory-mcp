@@ -177,6 +177,19 @@ describe('LanceMemoryStore integration', () => {
       expect(results[0].score).toBeGreaterThan(0.99);
     });
 
+    it('throws when the memory is deleted between the read and the write', async () => {
+      const memory = await store.store({ content: 'Short-lived memory', category: 'learning', tags: [] });
+      const internals = store as unknown as { fetchById(id: string): Promise<unknown> };
+      const row = await internals.fetchById(memory.id);
+
+      // Another process deletes it after update() has read the row
+      await store.delete(memory.id);
+      vi.spyOn(internals, 'fetchById').mockResolvedValueOnce(row);
+
+      await expect(store.update(memory.id, { tags: ['late'] })).rejects.toThrow('not found');
+      expect((await store.stats()).totalMemories).toBe(0);
+    });
+
     it('a tags-only update after an access keeps the row and its access count', async () => {
       const memory = await store.store({
         content: 'Memory about unique hamiltonian cycles',
