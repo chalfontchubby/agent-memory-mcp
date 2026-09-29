@@ -57,18 +57,30 @@ export class LanceMemoryStore implements MemoryStore {
   ) {}
 
   async initialize(): Promise<void> {
-    this.db = await lancedb.connect(this.dbPath);
+    // readConsistencyInterval 0: check for newer versions on every read, so writes by
+    // another process on the same database (another editor window's server) are seen
+    this.db = await lancedb.connect(this.dbPath, { readConsistencyInterval: 0 });
     this.reranker = await lancedb.rerankers.RRFReranker.create(60);
+    await this.openTableIfExists();
+  }
+
+  /**
+   * Open the memories table if it exists and is not open yet. Called before
+   * every operation while the table is missing, because another process
+   * (another editor window's server) may create it after this one started.
+   */
+  private async openTableIfExists(): Promise<void> {
+    if (this.table || !this.db) return;
     const names = await this.db.tableNames();
-    if (names.includes('memories')) {
-      this.table = await this.db.openTable('memories');
-      // Migrate schema: add access_count and last_accessed_at columns if missing.
-      // These were introduced in v1.1.2 for importance-driven decay.
-      await this.migrateSchema();
-      // Recreate FTS index with proper config (stemming, stop words, positions).
-      // replace: true makes this idempotent; negligible cost at our scale.
-      await this.tryCreateFtsIndex();
-    }
+    if (!names.includes('memories')) return;
+
+    this.table = await this.db.openTable('memories');
+    // Migrate schema: add access_count and last_accessed_at columns if missing.
+    // These were introduced in v1.1.2 for importance-driven decay.
+    await this.migrateSchema();
+    // Recreate FTS index with proper config (stemming, stop words, positions).
+    // replace: true makes this idempotent; negligible cost at our scale.
+    await this.tryCreateFtsIndex();
   }
 
   /**
@@ -83,12 +95,12 @@ export class LanceMemoryStore implements MemoryStore {
       // Probe for access_count by reading a single row
       const probe = await this.table.query().limit(1).toArray();
       if (probe.length > 0 && !('access_count' in probe[0])) {
-        console.log('[MemoryStore] Migrating schema: adding access_count and last_accessed_at columns');
+        console.error('[MemoryStore] Migrating schema: adding access_count and last_accessed_at columns');
         await this.table.addColumns([
           { name: 'access_count', valueSql: '0' },
           { name: 'last_accessed_at', valueSql: 'updated_at' },
         ]);
-        console.log('[MemoryStore] Schema migration complete');
+        console.error('[MemoryStore] Schema migration complete');
       }
     } catch (err) {
       // Non-fatal: if migration fails, the store degrades gracefully
@@ -132,6 +144,7 @@ export class LanceMemoryStore implements MemoryStore {
     mode: SearchMode = 'hybrid',
     filters: SearchFilters = {},
   ): Promise<SearchResult[]> {
+    await this.openTableIfExists();
     if (!this.table) return [];
 
     const limit = filters.limit ?? 10;
@@ -157,6 +170,7 @@ export class LanceMemoryStore implements MemoryStore {
   }
 
   async findRelated(memoryId: string, limit: number = 5): Promise<SearchResult[]> {
+    await this.openTableIfExists();
     if (!this.table) return [];
 
     const original = await this.fetchById(memoryId);
@@ -182,6 +196,7 @@ export class LanceMemoryStore implements MemoryStore {
   }
 
   async listRecent(limit: number = 10, category?: MemoryCategory): Promise<Memory[]> {
+    await this.openTableIfExists();
     if (!this.table) return [];
 
     let q = this.table.query();
@@ -199,6 +214,7 @@ export class LanceMemoryStore implements MemoryStore {
   // ── Mutation ────────────────────────────────────────────────────
 
   async update(id: string, updates: UpdateRequest): Promise<Memory> {
+    await this.openTableIfExists();
     if (!this.table) throw new Error('No memories stored yet');
 
     const existing = await this.fetchById(id);
@@ -236,6 +252,7 @@ export class LanceMemoryStore implements MemoryStore {
   }
 
   async delete(id: string): Promise<void> {
+    await this.openTableIfExists();
     if (!this.table) throw new Error('No memories stored yet');
     await this.table.delete(`id = '${sanitise(id)}'`);
   }
@@ -243,6 +260,7 @@ export class LanceMemoryStore implements MemoryStore {
   // ── Stats ──────────────────────────────────────────────────────
 
   async stats(): Promise<MemoryStats> {
+    await this.openTableIfExists();
     if (!this.table) {
       return {
         totalMemories: 0, byCategory: {},
@@ -313,6 +331,7 @@ export class LanceMemoryStore implements MemoryStore {
   async prune(options: PruneOptions = {}): Promise<PruneResult> {
     const { dryRun = true, minStrength = 0.05, maxDormantDays = 90 } = options;
 
+    await this.openTableIfExists();
     if (!this.table) {
       return { pruned: 0, inspected: 0, dryRun, candidates: [] };
     }
@@ -470,9 +489,17 @@ export class LanceMemoryStore implements MemoryStore {
    * Callers MUST check the return value to avoid double-inserting the seed.
    */
   private async ensureTable(seedRow: MemoryRow): Promise<boolean> {
+    await this.openTableIfExists();
     if (this.table) return false;
 
-    this.table = await this.db!.createTable('memories', [seedRow]);
+    try {
+      this.table = await this.db!.createTable('memories', [seedRow]);
+    } catch (err) {
+      // Another process created it between the check and the create
+      await this.openTableIfExists();
+      if (!this.table) throw err;
+      return false;
+    }
     await this.tryCreateFtsIndex();
     return true;
   }

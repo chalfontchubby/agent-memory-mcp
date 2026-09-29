@@ -214,6 +214,52 @@ describe('LanceMemoryStore integration', () => {
     });
   });
 
+  // ── Multiple processes on one database ──────────────────────
+
+  describe('a second store on the same database', () => {
+    it('sees memories written by the first after it opened the table', async () => {
+      await store.store({ content: 'First memory', category: 'learning', tags: [] });
+
+      // Stands in for a second MCP server process, e.g. another editor window
+      const other = new LanceMemoryStore(dbPath, embedder);
+      await other.initialize();
+      expect((await other.stats()).totalMemories).toBe(1);
+
+      await store.store({ content: 'Second memory', category: 'learning', tags: [] });
+
+      expect((await other.stats()).totalMemories).toBe(2);
+    });
+
+    it('picks up the table when another store creates it after this one started', async () => {
+      // Both start on an empty database, before the memories table exists
+      const other = new LanceMemoryStore(dbPath, embedder);
+      await other.initialize();
+
+      await store.store({ content: 'Memory about unique hamiltonian cycles', category: 'learning', tags: [] });
+
+      expect((await other.stats()).totalMemories).toBe(1);
+      const otherBumpsSettled = trackAccessBumps(other);
+      const results = await other.search('hamiltonian', 'keyword', { limit: 5 });
+      expect(results).toHaveLength(1);
+      await otherBumpsSettled();
+
+      await other.store({ content: 'Second memory', category: 'learning', tags: [] });
+      expect((await store.stats()).totalMemories).toBe(2);
+    });
+
+    it('two stores storing their first memories at once both succeed', async () => {
+      const other = new LanceMemoryStore(dbPath, embedder);
+      await other.initialize();
+
+      await Promise.all([
+        store.store({ content: 'From the first store', category: 'learning', tags: [] }),
+        other.store({ content: 'From the second store', category: 'learning', tags: [] }),
+      ]);
+
+      expect((await store.stats()).totalMemories).toBe(2);
+    });
+  });
+
   describe('delete removes exactly one row', () => {
     it('reduces count by one', async () => {
       const a = await store.store({ content: 'Keep', category: 'learning', tags: [] });
