@@ -209,26 +209,28 @@ export class LanceMemoryStore implements MemoryStore {
     const tags = updates.tags ?? JSON.parse(existing.tags as string);
     const now = new Date().toISOString();
 
-    const vector = updates.content
-      ? await this.embedder.embed(content)
-      : existing.vector as number[];
-
-    const updatedRow: MemoryRow = {
-      id,
+    // Update in place rather than delete-then-re-add. Re-adding a row read back
+    // from LanceDB fails (its vector comes back as an Arrow Vector, not number[]),
+    // and by then the delete has already removed the memory.
+    const values: Record<string, lancedb.IntoSql> = {
       content,
       category,
       tags: JSON.stringify(tags),
-      created_at: existing.created_at as string,
       updated_at: now,
-      vector,
-      access_count: safeAccessCount(existing),
-      last_accessed_at: (existing.last_accessed_at as string) ?? (existing.updated_at as string),
     };
+    if (updates.content) {
+      values.vector = await this.embedder.embed(content);
+    }
+    await this.table.update({ where: `id = '${sanitise(id)}'`, values });
 
-    await this.table.delete(`id = '${sanitise(id)}'`);
-    await this.table.add([updatedRow]);
-
-    return rowToMemory(updatedRow);
+    return {
+      id,
+      content,
+      category: category as MemoryCategory,
+      tags,
+      createdAt: existing.created_at as string,
+      updatedAt: now,
+    };
   }
 
   async delete(id: string): Promise<void> {
@@ -381,14 +383,15 @@ export class LanceMemoryStore implements MemoryStore {
         // Spacing effect: skip increment if accessed within the last hour
         if (hoursSince < 1) continue;
 
-        // LanceDB update: delete then re-add with incremented count
-        await this.table.delete(`id = '${sanitise(id)}'`);
-        const updatedRow = {
-          ...row,
-          access_count: safeAccessCount(row) + 1,
-          last_accessed_at: now,
-        };
-        await this.table.add([updatedRow]);
+        // Update in place: a failed delete-then-re-add would lose the memory
+        // (see update()), and this path swallows errors, so the loss was silent
+        await this.table.update({
+          where: `id = '${sanitise(id)}'`,
+          valuesSql: {
+            access_count: 'COALESCE(access_count, 0) + 1',
+            last_accessed_at: `'${now}'`,
+          },
+        });
       } catch {
         // Access tracking is best-effort — don't fail the search
       }
